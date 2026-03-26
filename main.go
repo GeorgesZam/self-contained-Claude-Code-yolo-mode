@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -28,32 +29,116 @@ type request struct {
 	Messages  []message `json:"messages"`
 }
 
+type config struct {
+	APIKey       string `json:"api_key"`
+	Model        string `json:"model"`
+	SystemPrompt string `json:"system_prompt"`
+}
+
+func configDir() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".yoloclaude")
+}
+
+func configPath() string {
+	return filepath.Join(configDir(), "config.json")
+}
+
+func loadConfig() (*config, error) {
+	data, err := os.ReadFile(configPath())
+	if err != nil {
+		return nil, err
+	}
+	var cfg config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func saveConfig(cfg *config) error {
+	os.MkdirAll(configDir(), 0700)
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	return os.WriteFile(configPath(), data, 0600)
+}
+
+func setupWizard(scanner *bufio.Scanner) *config {
+	fmt.Println("=== YoloClaude - First time setup ===")
+	fmt.Println()
+
+	fmt.Print("Enter your Anthropic API key: ")
+	scanner.Scan()
+	apiKey := strings.TrimSpace(scanner.Text())
+
+	fmt.Println()
+	fmt.Println("Choose a model:")
+	fmt.Println("  1) claude-sonnet-4-6 (default, fast)")
+	fmt.Println("  2) claude-opus-4-6 (most capable)")
+	fmt.Println("  3) claude-haiku-4-5 (fastest, cheapest)")
+	fmt.Print("Choice [1]: ")
+	scanner.Scan()
+	choice := strings.TrimSpace(scanner.Text())
+
+	model := "claude-sonnet-4-6"
+	switch choice {
+	case "2":
+		model = "claude-opus-4-6"
+	case "3":
+		model = "claude-haiku-4-5-20251001"
+	}
+
+	cfg := &config{
+		APIKey:       apiKey,
+		Model:        model,
+		SystemPrompt: "You are a helpful coding assistant. Be concise and direct.",
+	}
+
+	if err := saveConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not save config: %v\n", err)
+	} else {
+		fmt.Printf("\nConfig saved to %s\n", configPath())
+	}
+
+	fmt.Println()
+	return cfg
+}
+
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Println("yoloclaude", version)
 		return
 	}
 
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: ANTHROPIC_API_KEY environment variable is required")
-		os.Exit(1)
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	// Load or create config
+	cfg, err := loadConfig()
+	if err != nil || cfg.APIKey == "" {
+		// Check env var as fallback
+		if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+			cfg = &config{
+				APIKey:       key,
+				Model:        "claude-sonnet-4-6",
+				SystemPrompt: "You are a helpful coding assistant. Be concise and direct.",
+			}
+		} else {
+			cfg = setupWizard(scanner)
+		}
 	}
 
-	model := os.Getenv("YOLO_MODEL")
-	if model == "" {
-		model = "claude-sonnet-4-6"
+	// Override from env if set
+	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+		cfg.APIKey = key
+	}
+	if model := os.Getenv("YOLO_MODEL"); model != "" {
+		cfg.Model = model
 	}
 
-	systemPrompt := os.Getenv("YOLO_SYSTEM_PROMPT")
-	if systemPrompt == "" {
-		systemPrompt = "You are a helpful coding assistant. Be concise and direct."
-	}
-
-	// One-shot mode: pass prompt as argument
+	// One-shot mode
 	if len(os.Args) > 1 {
 		prompt := strings.Join(os.Args[1:], " ")
-		resp, err := sendMessage(apiKey, model, systemPrompt, []message{{Role: "user", Content: prompt}})
+		resp, err := sendMessage(cfg, []message{{Role: "user", Content: prompt}})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
@@ -63,10 +148,11 @@ func main() {
 	}
 
 	// Interactive mode
-	fmt.Printf("yoloclaude %s (model: %s)\nType 'exit' to quit.\n\n", version, model)
+	fmt.Printf("yoloclaude %s (model: %s)\n", version, cfg.Model)
+	fmt.Println("Commands: /clear, /model, /config, exit")
+	fmt.Println()
+
 	history := []message{}
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	for {
 		fmt.Print("> ")
@@ -85,13 +171,38 @@ func main() {
 			fmt.Println("History cleared.")
 			continue
 		}
+		if input == "/model" {
+			fmt.Printf("Current model: %s\n", cfg.Model)
+			fmt.Println("  1) claude-sonnet-4-6")
+			fmt.Println("  2) claude-opus-4-6")
+			fmt.Println("  3) claude-haiku-4-5")
+			fmt.Print("Choice: ")
+			if scanner.Scan() {
+				switch strings.TrimSpace(scanner.Text()) {
+				case "1":
+					cfg.Model = "claude-sonnet-4-6"
+				case "2":
+					cfg.Model = "claude-opus-4-6"
+				case "3":
+					cfg.Model = "claude-haiku-4-5-20251001"
+				}
+				saveConfig(cfg)
+				fmt.Printf("Model set to %s\n", cfg.Model)
+			}
+			continue
+		}
+		if input == "/config" {
+			fmt.Printf("Config: %s\n", configPath())
+			fmt.Printf("Model:  %s\n", cfg.Model)
+			fmt.Printf("API Key: %s...%s\n", cfg.APIKey[:4], cfg.APIKey[len(cfg.APIKey)-4:])
+			continue
+		}
 
 		history = append(history, message{Role: "user", Content: input})
 
-		resp, err := streamMessage(apiKey, model, systemPrompt, history)
+		resp, err := streamMessage(cfg, history)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
-			// Remove failed message from history
 			history = history[:len(history)-1]
 			continue
 		}
@@ -101,18 +212,18 @@ func main() {
 	}
 }
 
-func sendMessage(apiKey, model, system string, messages []message) (string, error) {
+func sendMessage(cfg *config, messages []message) (string, error) {
 	body, _ := json.Marshal(request{
-		Model:     model,
+		Model:     cfg.Model,
 		MaxTokens: 4096,
-		System:    system,
+		System:    cfg.SystemPrompt,
 		Stream:    false,
 		Messages:  messages,
 	})
 
 	req, _ := http.NewRequest("POST", apiURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("x-api-key", cfg.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -138,18 +249,18 @@ func sendMessage(apiKey, model, system string, messages []message) (string, erro
 	return result.Content[0].Text, nil
 }
 
-func streamMessage(apiKey, model, system string, messages []message) (string, error) {
+func streamMessage(cfg *config, messages []message) (string, error) {
 	body, _ := json.Marshal(request{
-		Model:     model,
+		Model:     cfg.Model,
 		MaxTokens: 4096,
-		System:    system,
+		System:    cfg.SystemPrompt,
 		Stream:    true,
 		Messages:  messages,
 	})
 
 	req, _ := http.NewRequest("POST", apiURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("x-api-key", cfg.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -164,9 +275,9 @@ func streamMessage(apiKey, model, system string, messages []message) (string, er
 	}
 
 	var full strings.Builder
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
+	sc := bufio.NewScanner(resp.Body)
+	for sc.Scan() {
+		line := sc.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
